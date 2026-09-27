@@ -14,19 +14,103 @@ import re
 import io
 import base64
 
-import urllib.request
-import urllib.parse
-urlopen = urllib.request.urlopen
-urlencode = urllib.parse.urlencode
+import time
+from collections import defaultdict, deque
 
 from tornado.options import define, options
-import io
 
 define("port", default=int(os.environ.get("PORT", 80)), help="run on the given port", type=int)
 
+# Exact CORS allowlist - reject every other origin. No wildcards, no reflection.
+APPROVED_ORIGINS = {
+    "https://aamarva.com",
+    "https://ais-dev-sy4lhzb3bv4g4mm7spkr5c-89865814157.asia-southeast1.run.app",
+}
 
+class RateLimiter:
+    """
+    In-memory rate limiter using a sliding-window counter per client IP.
+    """
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(deque)
 
-class MainHandler(tornado.web.RequestHandler):
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        q = self.requests[key]
+        while q and q[0] <= now - self.window_seconds:
+            q.popleft()
+        if len(q) >= self.max_requests:
+            return False
+        q.append(now)
+        return True
+
+    def clear(self):
+        self.requests.clear()
+
+rate_limiter = RateLimiter(
+    max_requests=int(os.environ.get("RATE_LIMIT_MAX", "60")),
+    window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW", "60")),
+)
+
+class SecurityMixin:
+    def check_origin_and_rate_limit(self) -> bool:
+        """
+        Validates the Origin header and applies rate limiting.
+        - CORS allows ONLY approved origins.
+        - Disallowed origins are rejected with 403 Forbidden.
+        - Approved origins bypass rate limiting completely.
+        - Requests without an approved origin are subject to rate limiting.
+        """
+        origin = self.request.headers.get("Origin")
+        if origin is not None:
+            if origin not in APPROVED_ORIGINS:
+                self.set_status(403)
+                self.finish("Forbidden: Origin not allowed")
+                return False
+            # Approved origin: set exact CORS headers and bypass rate limiting
+            self.set_header("Access-Control-Allow-Origin", origin)
+            self.set_header("Vary", "Origin")
+            self.set_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            return True
+
+        # Direct requests without Origin header: enforce rate limiting
+        client_ip = self.request.remote_ip or "unknown"
+        if not rate_limiter.is_allowed(client_ip):
+            self.set_status(429)
+            self.set_header("Retry-After", str(rate_limiter.window_seconds))
+            self.finish("Too Many Requests: Rate limit exceeded")
+            return False
+
+        return True
+
+    def handle_options(self):
+        origin = self.request.headers.get("Origin")
+        if origin is not None:
+            if origin not in APPROVED_ORIGINS:
+                self.set_status(403)
+                self.finish("Forbidden: Origin not allowed")
+                return
+            self.set_header("Access-Control-Allow-Origin", origin)
+            self.set_header("Vary", "Origin")
+            self.set_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.set_header("Access-Control-Max-Age", "86400")
+            self.set_status(204)
+            self.finish()
+            return
+        self.set_status(204)
+        self.finish()
+
+class MainHandler(tornado.web.RequestHandler, SecurityMixin):
+    def prepare(self):
+        if not self.check_origin_and_rate_limit():
+            return
+
+    def options(self, *args, **kwargs):
+        self.handle_options()
     def get(self):
         ip = self.request.remote_ip
 
@@ -229,11 +313,18 @@ class MainHandler(tornado.web.RequestHandler):
         random.shuffle(drquotes)
         self.write(self.render_string('templates/root.html',ip=ip,robo=random.choice(robo),drquote1=drquotes[1],drquote2=drquotes[2],quotes=quotes,catquotes=catquotes,avatarquotes=avatarquotes,gorillaquotes=gorillaquotes))
 
-class ImgHandler(tornado.web.RequestHandler):
+class ImgHandler(tornado.web.RequestHandler, SecurityMixin):
     """
     The ImageHandler is our tornado class for creating a robot.
     called as Robohash.org/$1, where $1 becomes the seed string for the Robohash obj
     """
+    def prepare(self):
+        if not self.check_origin_and_rate_limit():
+            return
+
+    def options(self, *args, **kwargs):
+        self.handle_options()
+
     def get(self, string: str = None):
         """
         Handle GET requests for robot images
@@ -275,14 +366,13 @@ class ImgHandler(tornado.web.RequestHandler):
             for st in split:
                 b = st.split('_')
                 if len(b) == 2:
-                    if b[0] in ['gravatar','ignoreext','size','set','bgset','color']:
+                    if b[0] in ['ignoreext','size','set','bgset','color']:
                         args[b[0]] = b[1]
                         string = re.sub("/" + st,'',string)
 
         # Ensure we have something to hash!
         if string is None:
             string = self.request.remote_ip
-
 
         # Detect if the user has passed in a flag to ignore extensions.
         # Pass this along to to Robohash obj later on.
@@ -297,70 +387,18 @@ class ImgHandler(tornado.web.RequestHandler):
                 if sizey > 4096 or sizey < 0:
                     sizey = 300
 
-        # Allow Gravatar lookups -
-        # This allows people to pass in a gravatar-style hash, and return their gravatar image, instead of a Robohash.
-        # This is often used for example, to show a Gravatar if it's set for an email, or a Robohash if not.
-        if args.get('gravatar','').lower() == 'yes':
-            # They have requested that we hash the email, and send it to Gravatar.
-            default = "404"
-            gravatar_url = f"https://secure.gravatar.com/avatar/{hashlib.md5(string.lower().encode('utf-8')).hexdigest()}?"
-            gravatar_url += urlencode({'default':default, 'size':str(sizey)})
-        elif args.get('gravatar','').lower() == 'hashed':
-            # They have sent us a pre-hashed email address.
-            default = "404"
-            gravatar_url = f"https://secure.gravatar.com/avatar/{string}?"
-            gravatar_url += urlencode({'default':default, 'size':str(sizey)})
-
-        # If we do want a gravatar, request one. If we can't get it, just keep going, and return a robohash
-        if args.get('gravatar','').lower() in ['hashed','yes']:
-            try:
-                f = urlopen(gravatar_url)
-                self.redirect(gravatar_url, permanent=False)
-                return
-            except:
-                args['avatar'] = False
-
         # Create our Robohashing object
         r = Robohash(string=string,ignoreext=ignoreext)
 
-        # Allow users to manually specify a robot 'set' that they like.
-        # Ensure that this is one of the allowed choices, or allow all
-        # If they don't set one, take the first entry from sets above.
+        # RoboHash must use Set 1 ONLY.
+        roboset = 'set1'
 
-        if args.get('set',r.sets[0]) in r.sets:
-            roboset = args.get('set',r.sets[0])
-        elif args.get('set',r.sets[0]) == 'any':
-            # Add ugly hack.
-
-            # Adding cats and people per submitted/requested code, but I don't want to change existing hashes for set=any
-            # so we'll ignore those sets for the 'any' config.
-            roboset = r.sets[r.hasharray[1] % (len(r.sets)-2) ]
-        else:
-            roboset = r.sets[0]
-
-        # If they specified multiple sets, use up a bit of randomness to choose one.
-        # If they didn't specify one, default to whatever we decided above.
-
-        possiblesets = []
-        for tmpset in args.get('sets',roboset).split(','):
-            if tmpset in r.sets:
-                possiblesets.append(tmpset)
-        if possiblesets:
-            roboset = possiblesets[r.hasharray[1] % len(possiblesets) ]
-
-
-        # Only set1 is setup to be color-seletable. The others don't have enough pieces in various colors.
-        # This could/should probably be expanded at some point..
-        # Right now, this feature is almost never used. ( It was < 44 requests this year, out of 78M reqs )
-
+        # Set 1 color selection:
+        # If color is specified and valid, use it; otherwise deterministically select from Set 1 colors.
         if args.get('color') in r.colors:
-            roboset = 'set1'
             color = args.get('color')
-
-        # If they DID choose set1, randomly choose a color.
-        if roboset == 'set1' and color is None:
-            color = r.colors[r.hasharray[0] % len(r.colors) ]
-            roboset = 'set1'
+        else:
+            color = r.colors[r.hasharray[0] % len(r.colors)]
 
         # Allow them to set a background, or keep as None
         if args.get('bgset') in r.bgsets + ['any']:
@@ -370,8 +408,8 @@ class ImgHandler(tornado.web.RequestHandler):
         self.set_header("Content-Type", "image/" + r.format)
         self.set_header("Cache-Control", "public,max-age=31536000")
 
-        # Build our Robot.
-        r.assemble(roboset=roboset,format=r.format,bgset=bgset,color=color,sizex=sizex,sizey=sizey)
+        # Build our Robot (Set 1 ONLY).
+        r.assemble(roboset='set1',format=r.format,bgset=bgset,color=color,sizex=sizex,sizey=sizey)
 
         # Print the Robot to the handler, as a file-like obj
         if r.format != 'datauri':
@@ -385,6 +423,14 @@ class ImgHandler(tornado.web.RequestHandler):
             b64ver = b64ver.decode('utf-8')
             self.write("data:image/png;base64," + str(b64ver))
 
+class SafeStaticFileHandler(tornado.web.StaticFileHandler, SecurityMixin):
+    def prepare(self):
+        if not self.check_origin_and_rate_limit():
+            return
+
+    def options(self, *args, **kwargs):
+        self.handle_options()
+
 def main():
         tornado.options.parse_command_line()
         # timeout in seconds
@@ -397,9 +443,9 @@ def main():
         }
 
         application = tornado.web.Application([
-                (r'/(crossdomain\.xml)', tornado.web.StaticFileHandler, {"path": os.path.join(os.path.dirname(__file__),
+                (r'/(crossdomain\.xml)', SafeStaticFileHandler, {"path": os.path.join(os.path.dirname(__file__),
                 "static/")}),
-                (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": os.path.join(os.path.dirname(__file__),
+                (r"/static/(.*)", SafeStaticFileHandler, {"path": os.path.join(os.path.dirname(__file__),
                 "static/")}),
                 (r"/", MainHandler),
                 (r"/(.*)", ImgHandler),

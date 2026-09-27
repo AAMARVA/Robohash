@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" ?> 
 <cross-domain-policy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.adobe.com/xml/schemas/PolicyFile.xsd">
-  <allow-access-from domain="*" />
-  <allow-http-request-headers-from domain="*" headers="*" secure="false" /> 
+  <allow-access-from domain="aamarva.com" secure="true" />
+  <allow-access-from domain="ais-dev-sy4lhzb3bv4g4mm7spkr5c-89865814157.asia-southeast1.run.app" secure="true" />
+  <allow-http-request-headers-from domain="aamarva.com" headers="*" secure="true" />
+  <allow-http-request-headers-from domain="ais-dev-sy4lhzb3bv4g4mm7spkr5c-89865814157.asia-southeast1.run.app" headers="*" secure="true" />
 </cross-domain-policy>
